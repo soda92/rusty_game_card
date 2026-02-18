@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, DiagnosticsStore};
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use rand::Rng;
 
@@ -31,12 +32,36 @@ struct FireworkRocket {
     velocity: Vec3,
     target_height: f32,
     color: Color,
+    is_cluster: bool,
+    trail_timer: Timer, // Control smoke emission rate
+}
+
+#[derive(Component)]
+struct ClusterBomblet {
+    velocity: Vec3,
+    fuse_timer: Timer,
+    color: Color,
 }
 
 #[derive(Component)]
 struct FireworkParticle {
     velocity: Vec3,
     lifetime: Timer,
+}
+
+#[derive(Component)]
+struct TrailParticle {
+    lifetime: Timer,
+    initial_scale: f32,
+}
+
+// Controls the shared material for an explosion to fade it out
+#[derive(Component)]
+struct ExplosionFade {
+    material: Handle<StandardMaterial>,
+    lifetime: Timer,
+    initial_color: LinearRgba,
+    initial_intensity: f32, // For light fading
 }
 
 #[derive(Component)]
@@ -58,7 +83,8 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(EguiPlugin)
-        .insert_resource(ClearColor(Color::BLACK)) // Night sky
+        .add_plugins(FrameTimeDiagnosticsPlugin)
+        .insert_resource(ClearColor(Color::BLACK))
         .init_resource::<FireworkConfig>()
         .add_systems(Startup, setup)
         .add_systems(Update, (
@@ -66,7 +92,10 @@ fn main() {
             pan_orbit_camera, 
             firework_spawner, 
             rocket_movement, 
+            cluster_movement,
             particle_physics,
+            trail_particle_system, // New system for trails
+            explosion_fade_system, 
             draw_gizmos
         ))
         .run();
@@ -75,21 +104,21 @@ fn main() {
 fn setup(
     mut commands: Commands,
 ) {
-    // Camera
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 15.0, 50.0).looking_at(Vec3::new(0.0, 15.0, 0.0), Vec3::Y),
         OrbitCamera::default(),
     ));
 
-    // Light (optional, particles are emissive but scene might need light)
+    // Ambient-ish light to see the ground when no fireworks
     commands.spawn((
         PointLight {
-            intensity: 100_000.0,
-            shadows_enabled: true,
+            intensity: 5_000.0,
+            shadows_enabled: false,
+            range: 100.0,
             ..default()
         },
-        Transform::from_xyz(0.0, 25.0, 0.0),
+        Transform::from_xyz(0.0, 20.0, 0.0),
     ));
 }
 
@@ -113,26 +142,28 @@ fn spawn_rocket(
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
     let mut rng = rand::thread_rng();
-    let x = rng.gen_range(-10.0..10.0);
-    let z = rng.gen_range(-10.0..10.0);
-    let target_height = rng.gen_range(15.0..30.0);
+    let x = rng.gen_range(-15.0..15.0);
+    let z = rng.gen_range(-15.0..15.0);
+    let target_height = rng.gen_range(20.0..35.0);
     
-    // Random color
     let hue = rng.gen_range(0.0..360.0);
     let color = Color::hsl(hue, 1.0, 0.5);
+    let is_cluster = rng.gen_bool(0.3);
 
     commands.spawn((
         Mesh3d(meshes.add(Mesh::from(Sphere::new(0.2)))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: color,
-            emissive: LinearRgba::from(color) * 5.0, // Glow
+            emissive: LinearRgba::from(color) * 5.0,
             ..default()
         })),
         Transform::from_xyz(x, 0.0, z),
         FireworkRocket {
-            velocity: Vec3::new(0.0, 15.0, 0.0), // Initial upward velocity
+            velocity: Vec3::new(0.0, 20.0, 0.0),
             target_height,
             color,
+            is_cluster,
+            trail_timer: Timer::from_seconds(0.05, TimerMode::Repeating),
         },
     ));
 }
@@ -143,17 +174,109 @@ fn rocket_movement(
     mut materials: ResMut<Assets<StandardMaterial>>,
     time: Res<Time>,
     config: Res<FireworkConfig>,
-    mut query: Query<(Entity, &mut Transform, &FireworkRocket)>,
+    mut query: Query<(Entity, &mut Transform, &mut FireworkRocket)>,
 ) {
-    for (entity, mut transform, rocket) in query.iter_mut() {
-        // Move up
+    let mut rng = rand::thread_rng();
+    
+    // Pre-create trail material (white smoke)
+    let trail_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.8, 0.8, 0.8),
+        emissive: LinearRgba::gray(0.5),
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    let trail_mesh = meshes.add(Mesh::from(Sphere::new(0.1)));
+
+    for (entity, mut transform, mut rocket) in query.iter_mut() {
         transform.translation += rocket.velocity * time.delta_secs();
 
-        // Check if reached target height
+        // Spawn Trail
+        rocket.trail_timer.tick(time.delta());
+        if rocket.trail_timer.just_finished() {
+             commands.spawn((
+                Mesh3d(trail_mesh.clone()),
+                MeshMaterial3d(trail_mat.clone()),
+                Transform::from_translation(transform.translation + Vec3::new(
+                    rng.gen_range(-0.1..0.1), -0.2, rng.gen_range(-0.1..0.1)
+                )),
+                TrailParticle {
+                    lifetime: Timer::from_seconds(0.5, TimerMode::Once),
+                    initial_scale: 1.0,
+                },
+            ));
+        }
+
         if transform.translation.y >= rocket.target_height {
-            // Explode!
             commands.entity(entity).despawn();
-            spawn_explosion(&mut commands, &mut meshes, &mut materials, transform.translation, rocket.color, &config);
+            
+            if rocket.is_cluster {
+                spawn_cluster(&mut commands, &mut meshes, &mut materials, transform.translation, rocket.color);
+            } else {
+                spawn_explosion(&mut commands, &mut meshes, &mut materials, transform.translation, rocket.color, &config);
+            }
+        }
+    }
+}
+
+fn spawn_cluster(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    position: Vec3,
+    color: Color,
+) {
+    let mut rng = rand::thread_rng();
+    let bomblet_count = rng.gen_range(5..12);
+    
+    let mesh_handle = meshes.add(Mesh::from(Sphere::new(0.15)));
+    let material_handle = materials.add(StandardMaterial {
+        base_color: color,
+        emissive: LinearRgba::from(color) * 8.0,
+        ..default()
+    });
+
+    for _ in 0..bomblet_count {
+        let vx = rng.gen_range(-5.0..5.0);
+        let vy = rng.gen_range(2.0..8.0);
+        let vz = rng.gen_range(-5.0..5.0);
+        let fuse = rng.gen_range(0.3..0.8);
+
+        commands.spawn((
+            Mesh3d(mesh_handle.clone()),
+            MeshMaterial3d(material_handle.clone()),
+            Transform::from_translation(position),
+            ClusterBomblet {
+                velocity: Vec3::new(vx, vy, vz),
+                fuse_timer: Timer::from_seconds(fuse, TimerMode::Once),
+                color,
+            },
+        ));
+    }
+}
+
+fn cluster_movement(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    time: Res<Time>,
+    config: Res<FireworkConfig>,
+    mut query: Query<(Entity, &mut Transform, &mut ClusterBomblet)>,
+) {
+    for (entity, mut transform, mut bomblet) in query.iter_mut() {
+        bomblet.fuse_timer.tick(time.delta());
+        
+        bomblet.velocity.y -= config.gravity * time.delta_secs();
+        transform.translation += bomblet.velocity * time.delta_secs();
+
+        if bomblet.fuse_timer.finished() {
+            commands.entity(entity).despawn();
+            let mut sub_config = FireworkConfig::default();
+            sub_config.particle_count = config.particle_count / 4;
+            sub_config.explosion_force = config.explosion_force * 0.7;
+            sub_config.gravity = config.gravity;
+            sub_config.drag = config.drag;
+            
+            spawn_explosion(&mut commands, &mut meshes, &mut materials, transform.translation, bomblet.color, &sub_config);
         }
     }
 }
@@ -168,16 +291,36 @@ fn spawn_explosion(
 ) {
     let mut rng = rand::thread_rng();
     
-    let mesh_handle = meshes.add(Mesh::from(Sphere::new(0.1)));
+    // Particle Mesh (Capsule works better for streaks, but Sphere stretched also works)
+    let mesh_handle = meshes.add(Mesh::from(Sphere::new(0.05)));
     let material_handle = materials.add(StandardMaterial {
         base_color: color,
-        emissive: LinearRgba::from(color) * 10.0, // Bright glow
-        unlit: true, // Don't react to light, just glow
+        emissive: LinearRgba::from(color) * 10.0,
+        unlit: true,
         ..default()
     });
 
+    let light_intensity = 500_000.0;
+
+    // Controller entity with PointLight
+    commands.spawn((
+        ExplosionFade {
+            material: material_handle.clone(),
+            lifetime: Timer::from_seconds(2.5, TimerMode::Once),
+            initial_color: LinearRgba::from(color),
+            initial_intensity: light_intensity,
+        },
+        PointLight {
+            intensity: light_intensity,
+            range: 50.0,
+            shadows_enabled: false, // Performance
+            color: color,
+            ..default()
+        },
+        Transform::from_translation(position),
+    ));
+
     for _ in 0..config.particle_count {
-        // Random direction on sphere
         let theta = rng.gen_range(0.0..std::f32::consts::TAU);
         let phi = rng.gen_range(0.0..std::f32::consts::PI);
         
@@ -203,6 +346,36 @@ fn spawn_explosion(
     }
 }
 
+fn explosion_fade_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut query: Query<(Entity, &mut ExplosionFade, &mut PointLight)>,
+) {
+    for (entity, mut fade, mut light) in query.iter_mut() {
+        fade.lifetime.tick(time.delta());
+
+        if fade.lifetime.finished() {
+            materials.remove(&fade.material);
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        let progress = fade.lifetime.fraction_remaining(); // 1.0 -> 0.0
+
+        // Fade Material
+        if let Some(material) = materials.get_mut(&fade.material) {
+            material.emissive = fade.initial_color * (10.0 * progress * progress);
+            let mut color = fade.initial_color;
+            color.alpha = progress;
+            material.base_color = Color::from(color);
+        }
+
+        // Fade Light
+        light.intensity = fade.initial_intensity * (progress * progress);
+    }
+}
+
 fn particle_physics(
     mut commands: Commands,
     time: Res<Time>,
@@ -217,15 +390,39 @@ fn particle_physics(
             continue;
         }
 
-        // Physics
-        particle.velocity.y -= config.gravity * time.delta_secs(); // Gravity
-        particle.velocity *= config.drag; // Drag/Air resistance
+        particle.velocity.y -= config.gravity * time.delta_secs();
+        particle.velocity *= config.drag;
 
         transform.translation += particle.velocity * time.delta_secs();
         
-        // Scale down as they die
-        let scale = particle.lifetime.fraction_remaining();
-        transform.scale = Vec3::splat(scale);
+        // STRETCH EFFECT: Look along velocity
+        if particle.velocity.length_squared() > 0.1 {
+            let look_target = transform.translation + particle.velocity;
+            transform.look_at(look_target, Vec3::Y);
+            
+            // Stretch Z based on speed
+            let speed_factor = particle.velocity.length() * 0.05;
+            transform.scale = Vec3::new(0.5, 0.5, 1.0 + speed_factor);
+        }
+    }
+}
+
+fn trail_particle_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut Transform, &mut TrailParticle)>,
+) {
+    for (entity, mut transform, mut trail) in query.iter_mut() {
+        trail.lifetime.tick(time.delta());
+
+        if trail.lifetime.finished() {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        let progress = trail.lifetime.fraction_remaining();
+        transform.scale = Vec3::splat(trail.initial_scale * progress);
+        transform.translation.y += 1.0 * time.delta_secs(); // Drift up slightly
     }
 }
 
@@ -235,19 +432,42 @@ fn ui_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    diagnostics: Res<DiagnosticsStore>,
 ) {
     let ctx = contexts.ctx_mut();
 
     egui::Window::new("Firework Controls").show(ctx, |ui| {
+        if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS) {
+            if let Some(value) = fps.smoothed() {
+                ui.heading(format!("FPS: {:.1}", value));
+                ui.separator();
+            }
+        }
+
         ui.checkbox(&mut config.auto_launch, "Auto Launch");
         
         ui.add(egui::Slider::new(&mut config.gravity, 0.0..=20.0).text("Gravity"));
         ui.add(egui::Slider::new(&mut config.explosion_force, 1.0..=20.0).text("Explosion Force"));
         ui.add(egui::Slider::new(&mut config.drag, 0.9..=1.0).text("Air Drag"));
-        ui.add(egui::Slider::new(&mut config.particle_count, 10..=500).text("Particle Count"));
+        ui.add(egui::Slider::new(&mut config.particle_count, 10..=10000).text("Particle Count"));
+        
+        ui.separator();
         
         if ui.button("Launch Rocket").clicked() {
             spawn_rocket(&mut commands, &mut meshes, &mut materials);
+        }
+
+        ui.separator();
+        
+        if ui.button("Stress Test (Extreme)").clicked() {
+            config.particle_count = 2000;
+            config.launch_interval = Timer::from_seconds(0.1, TimerMode::Repeating);
+            config.auto_launch = true;
+            config.explosion_force = 10.0;
+        }
+
+        if ui.button("Reset Defaults").clicked() {
+            *config = FireworkConfig::default();
         }
     });
 }
@@ -312,7 +532,6 @@ fn pan_orbit_camera(
 }
 
 fn draw_gizmos(mut gizmos: Gizmos) {
-    // Ground Grid
     let grid_size = 20;
     let grid_spacing = 2.0;
     let grid_color = Color::srgb(0.2, 0.2, 0.2); 
