@@ -52,7 +52,7 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.9, 0.9, 0.9))) // Light gray background
         .init_resource::<CadParams>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (ui_system, update_mesh_system, pan_orbit_camera))
+        .add_systems(Update, (ui_system, update_mesh_system, pan_orbit_camera, draw_gizmos))
         .run();
 }
 
@@ -162,40 +162,105 @@ fn ui_system(
     mut contexts: EguiContexts, 
     mut params: ResMut<CadParams>,
     mut camera_query: Query<(&mut OrbitCamera, &mut Transform)>,
+    mut exit: EventWriter<AppExit>,
 ) {
     let ctx = contexts.ctx_mut();
-    egui::Window::new("CAD Controls").show(ctx, |ui| {
-        if ui.add(egui::Slider::new(&mut params.radius, 0.1..=5.0).text("Radius")).changed() {
-            params.regenerate = true;
-        }
-        if ui.add(egui::Slider::new(&mut params.height, 0.1..=5.0).text("Height")).changed() {
-            params.regenerate = true;
-        }
-        if ui.add(egui::Slider::new(&mut params.resolution, 0.01..=0.5).text("Tessellation")).changed() {
-            params.regenerate = true;
-        }
-        
+    let mut reset_camera = false;
+
+    // 1. Top Menu Bar
+    egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Exit").clicked() {
+                    exit.send(AppExit::Success);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.button("Reset Camera").clicked() {
+                    reset_camera = true;
+                }
+            });
+        });
+    });
+
+    // 2. Bottom Status Bar
+    egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Ready");
+            ui.separator();
+            ui.label(format!("Radius: {:.2} | Height: {:.2}", params.radius, params.height));
+        });
+    });
+
+    // 3. Left Side Panel (Properties)
+    egui::SidePanel::left("left_panel").resizable(true).default_width(200.0).show(ctx, |ui| {
+        ui.heading("Properties");
         ui.separator();
+        
+        ui.collapsing("Dimensions", |ui| {
+            if ui.add(egui::Slider::new(&mut params.radius, 0.1..=5.0).text("Radius")).changed() {
+                params.regenerate = true;
+            }
+            if ui.add(egui::Slider::new(&mut params.height, 0.1..=5.0).text("Height")).changed() {
+                params.regenerate = true;
+            }
+        });
+
+        ui.collapsing("Mesh Settings", |ui| {
+            if ui.add(egui::Slider::new(&mut params.resolution, 0.01..=0.5).text("Tessellation")).changed() {
+                params.regenerate = true;
+            }
+        });
+
+        ui.add_space(10.0);
         
         ui.horizontal(|ui| {
             if ui.button("Regenerate").clicked() {
                 params.regenerate = true;
             }
-            if ui.button("Reset Model").clicked() {
+            if ui.button("Reset Defaults").clicked() {
                 *params = CadParams::default();
             }
         });
-
-        ui.separator();
-
-        if ui.button("Reset Camera").clicked() {
-            for (mut orbit, mut transform) in camera_query.iter_mut() {
-                *orbit = OrbitCamera::default();
-                transform.translation = Vec3::new(-5.0, 5.0, 5.0);
-                transform.look_at(Vec3::ZERO, Vec3::Y);
-            }
-        }
     });
+
+    // Handle Camera Reset
+    if reset_camera {
+        for (mut orbit, mut transform) in camera_query.iter_mut() {
+            *orbit = OrbitCamera::default();
+            transform.translation = Vec3::new(-5.0, 5.0, 5.0);
+            transform.look_at(Vec3::ZERO, Vec3::Y);
+        }
+    }
+}
+
+fn draw_gizmos(mut gizmos: Gizmos) {
+    // 1. Grid (XZ plane)
+    let grid_size = 10;
+    let grid_spacing = 1.0;
+    let grid_color = Color::srgb(0.7, 0.7, 0.7); // Light gray grid lines
+
+    for i in -grid_size..=grid_size {
+        let x = i as f32 * grid_spacing;
+        // Lines along Z
+        gizmos.line(
+            Vec3::new(x, 0.0, -grid_size as f32 * grid_spacing), 
+            Vec3::new(x, 0.0, grid_size as f32 * grid_spacing), 
+            grid_color
+        );
+        // Lines along X
+        let z = i as f32 * grid_spacing;
+        gizmos.line(
+            Vec3::new(-grid_size as f32 * grid_spacing, 0.0, z), 
+            Vec3::new(grid_size as f32 * grid_spacing, 0.0, z), 
+            grid_color
+        );
+    }
+
+    // 2. Axes (X=Red, Y=Green, Z=Blue)
+    gizmos.line(Vec3::ZERO, Vec3::X * 2.0, Color::srgb(1.0, 0.0, 0.0));
+    gizmos.line(Vec3::ZERO, Vec3::Y * 2.0, Color::srgb(0.0, 1.0, 0.0));
+    gizmos.line(Vec3::ZERO, Vec3::Z * 2.0, Color::srgb(0.0, 0.0, 1.0));
 }
 
 fn update_mesh_system(
